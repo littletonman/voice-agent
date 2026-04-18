@@ -7,10 +7,14 @@ from supabase import create_client, Client
 
 load_dotenv()
 
-supabase: Client = create_client(
-    os.environ["SUPABASE_URL"],
-    os.environ["SUPABASE_SERVICE_ROLE_KEY"],
-)
+
+def _get_supabase() -> Client:
+    """Lazy Supabase client — only connects when a tool is actually called."""
+    url = os.environ.get("SUPABASE_URL", "")
+    key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
+    if not url or not key:
+        raise RuntimeError("SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be set")
+    return create_client(url, key)
 
 
 def get_services(category: Optional[str] = None) -> dict:
@@ -20,7 +24,8 @@ def get_services(category: Optional[str] = None) -> dict:
         category: Filter by service category (e.g. "wash", "detail", "addon").
                   If None, returns all services.
     """
-    query = supabase.table("services").select("*")
+    sb = _get_supabase()
+    query = sb.table("services").select("*").eq("is_active", True)
     if category:
         query = query.eq("category", category)
     result = query.execute()
@@ -28,17 +33,18 @@ def get_services(category: Optional[str] = None) -> dict:
 
 
 def get_membership_info(tier: Optional[str] = None) -> dict:
-    """Retrieve membership plan details, optionally filtered by tier.
+    """Retrieve membership plan details, optionally filtered by plan name.
 
     Args:
-        tier: Specific membership tier (e.g. "basic", "premium", "unlimited").
-              If None, returns all tiers.
+        tier: Specific membership plan name (e.g. "Silver", "Gold", "Platinum").
+              If None, returns all plans.
     """
-    query = supabase.table("memberships").select("*")
+    sb = _get_supabase()
+    query = sb.table("membership_plans").select("*")
     if tier:
-        query = query.eq("tier", tier)
+        query = query.ilike("name", f"%{tier}%")
     result = query.execute()
-    return {"memberships": result.data}
+    return {"membership_plans": result.data}
 
 
 def check_availability(location_id: str, date: str, service_id: str) -> dict:
@@ -49,24 +55,33 @@ def check_availability(location_id: str, date: str, service_id: str) -> dict:
         date: The date to check in YYYY-MM-DD format.
         service_id: The ID of the desired service.
     """
-    result = supabase.table("appointments").select("datetime_slot").match(
-        {"location_id": location_id, "service_id": service_id}
-    ).gte("datetime_slot", f"{date}T00:00:00").lte(
-        "datetime_slot", f"{date}T23:59:59"
-    ).execute()
+    sb = _get_supabase()
+    # Get existing bookings for that date/location
+    result = (
+        sb.table("bookings")
+        .select("scheduled_at")
+        .eq("location_id", location_id)
+        .eq("status", "confirmed")
+        .gte("scheduled_at", f"{date}T00:00:00")
+        .lte("scheduled_at", f"{date}T23:59:59")
+        .execute()
+    )
+    booked_slots = [row["scheduled_at"] for row in result.data]
 
-    booked_slots = [row["datetime_slot"] for row in result.data]
-
-    # Fetch location operating hours to compute available slots
-    hours_result = supabase.table("locations").select(
-        "opening_time, closing_time"
-    ).eq("id", location_id).single().execute()
+    # Get location hours
+    loc_result = (
+        sb.table("locations")
+        .select("name, hours")
+        .eq("id", location_id)
+        .single()
+        .execute()
+    )
 
     return {
         "date": date,
         "location_id": location_id,
         "booked_slots": booked_slots,
-        "operating_hours": hours_result.data,
+        "location": loc_result.data,
     }
 
 
@@ -75,7 +90,7 @@ def book_appointment(
     location_id: str,
     service_id: str,
     datetime_str: str,
-    vehicle_info: dict,
+    vehicle_info: str,
 ) -> dict:
     """Book a car wash appointment.
 
@@ -84,20 +99,28 @@ def book_appointment(
         location_id: The ID of the car wash location.
         service_id: The ID of the selected service.
         datetime_str: Appointment date and time in ISO 8601 format.
-        vehicle_info: Dict with keys like "make", "model", "color".
+        vehicle_info: Description of the vehicle (e.g. "Red Toyota Camry").
     """
+    sb = _get_supabase()
+
+    # Look up customer by phone
+    cust_result = (
+        sb.table("customers")
+        .select("id")
+        .eq("phone", customer_phone)
+        .execute()
+    )
+    customer_id = cust_result.data[0]["id"] if cust_result.data else None
+
     record = {
-        "customer_phone": customer_phone,
+        "customer_id": customer_id,
         "location_id": location_id,
         "service_id": service_id,
-        "datetime_slot": datetime_str,
-        "vehicle_make": vehicle_info.get("make"),
-        "vehicle_model": vehicle_info.get("model"),
-        "vehicle_color": vehicle_info.get("color"),
+        "scheduled_at": datetime_str,
+        "vehicle_info": vehicle_info,
         "status": "confirmed",
-        "created_at": datetime.utcnow().isoformat(),
     }
-    result = supabase.table("appointments").insert(record).execute()
+    result = sb.table("bookings").insert(record).execute()
     return {"appointment": result.data[0] if result.data else None}
 
 
@@ -110,11 +133,12 @@ def cancel_appointment(
         appointment_id: The ID of the appointment to cancel.
         reason: Optional reason for cancellation.
     """
+    sb = _get_supabase()
     update = {"status": "cancelled"}
     if reason:
-        update["cancellation_reason"] = reason
+        update["notes"] = reason
     result = (
-        supabase.table("appointments")
+        sb.table("bookings")
         .update(update)
         .eq("id", appointment_id)
         .execute()
@@ -129,23 +153,13 @@ def lookup_customer(query: str, search_by: str = "phone") -> dict:
         query: The search value (phone number or name).
         search_by: Field to search — "phone" or "name". Defaults to "phone".
     """
+    sb = _get_supabase()
     if search_by == "phone":
-        result = (
-            supabase.table("customers")
-            .select("*")
-            .eq("phone", query)
-            .execute()
-        )
+        result = sb.table("customers").select("*").eq("phone", query).execute()
     elif search_by == "name":
-        result = (
-            supabase.table("customers")
-            .select("*")
-            .ilike("name", f"%{query}%")
-            .execute()
-        )
+        result = sb.table("customers").select("*").ilike("name", f"%{query}%").execute()
     else:
         return {"error": f"Invalid search_by value: {search_by}"}
-
     return {"customers": result.data}
 
 
@@ -159,23 +173,30 @@ def file_complaint(
 
     Args:
         description: Detailed description of the complaint.
-        category: Complaint category (e.g. "service_quality", "wait_time",
-                  "damage", "staff", "billing", "other").
+        category: Complaint category (e.g. "damage", "quality", "wait_time",
+                  "billing", "staff", "other").
         customer_phone: Optional phone number of the customer filing the complaint.
         appointment_id: Optional related appointment ID.
     """
+    sb = _get_supabase()
+
+    # Look up customer if phone provided
+    customer_id = None
+    if customer_phone:
+        cust_result = sb.table("customers").select("id").eq("phone", customer_phone).execute()
+        customer_id = cust_result.data[0]["id"] if cust_result.data else None
+
     record = {
         "description": description,
         "category": category,
         "status": "open",
-        "created_at": datetime.utcnow().isoformat(),
     }
-    if customer_phone:
-        record["customer_phone"] = customer_phone
+    if customer_id:
+        record["customer_id"] = customer_id
     if appointment_id:
-        record["appointment_id"] = appointment_id
+        record["booking_id"] = appointment_id
 
-    result = supabase.table("complaints").insert(record).execute()
+    result = sb.table("complaints").insert(record).execute()
     return {"complaint": result.data[0] if result.data else None}
 
 
@@ -185,9 +206,8 @@ def get_operating_hours(location_id: Optional[str] = None) -> dict:
     Args:
         location_id: Specific location ID. If None, returns hours for all locations.
     """
-    query = supabase.table("locations").select(
-        "id, name, address, opening_time, closing_time, days_open"
-    )
+    sb = _get_supabase()
+    query = sb.table("locations").select("id, name, address, phone, hours")
     if location_id:
         query = query.eq("id", location_id)
     result = query.execute()
